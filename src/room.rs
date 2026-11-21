@@ -38,6 +38,8 @@ impl Room {
         match gossipsub.publish(self.topic.clone(), message) {
             // It's normal to have no peers right after startup; don't treat this as an error.
             Err(gossipsub::PublishError::InsufficientPeers) => Ok(()),
+            // Re-announcing the same JOIN within the dedup window is harmless.
+            Err(gossipsub::PublishError::Duplicate) => Ok(()),
             Err(e) => Err(e.into()),
             Ok(_) => Ok(()),
         }

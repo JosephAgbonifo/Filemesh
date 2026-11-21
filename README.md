@@ -1,345 +1,106 @@
 # FileMesh-RS
 
-A peer-to-peer file transfer CLI application built with Rust and libp2p, featuring NAT traversal, relay fallback, and universal connectivity.
+Peer-to-peer file sharing in rooms, built on libp2p. Join a named room, offer a
+file, and the people you offer it to get it: chunked, hash-verified, resumable,
+with no central server.
 
-## Features
-
-- **Peer-to-peer file transfer** using libp2p custom protocol `/filemesh/1.0.0`
-- **NAT traversal detection** with AutoNAT
-- **Relay fallback** for connectivity in restrictive network environments
-- **DCUtR (Direct Connection Upgrade through Relay)** for hole-punching
-- **Gossipsub** for peer discovery and room management
-- **mDNS** for local network peer discovery
-- **Streaming file transfer** with progress indicators
-- **Connection type tracking**: Direct, Relayed, or Hole-Punched
-- **Broadcast or targeted file transfer**
-
-## Architecture
-
-```
-src/
-├── main.rs              # CLI interface and command handling
-├── libp2p_peer.rs       # libp2p node setup, swarm management, and event handling
-├── file_transfer.rs     # Custom file transfer protocol implementation
-└── room.rs              # Gossipsub room management
-```
-
-## Installation
-
-### Prerequisites
-
-- Rust 1.70+ (install from https://rustup.rs)
-
-### Build
+## Quick start
 
 ```bash
 cargo build --release
+
+# Terminal 1
+./target/release/filemesh-rs start --name alice --room demo
+
+# Terminal 2 (same LAN: peers find each other automatically via mDNS)
+./target/release/filemesh-rs start --name bob --room demo
 ```
 
-The binary will be available at `target/release/filemesh-rs`
+At the `>` prompt:
 
-## Usage
+| Command | What it does |
+|---|---|
+| `peers` | List room members and how each is connected |
+| `send --file <FILE> --to <NAME or PEER_ID>` | Offer a file to one peer |
+| `send --file <FILE> --broadcast` | Offer a file to everyone in the room |
+| `offers` | List incoming offers waiting for your answer |
+| `accept <N>` / `reject <N>` | Answer offer number N |
+| `quit` | Exit |
 
-### Starting a Peer
+Quote paths with spaces: `send --file "my notes.txt" --to bob`.
 
-Open a terminal and start the first peer:
+Nothing is downloaded until you `accept` (or you started with `--auto-accept`).
+Files land in `received_files/` (change with `--download-dir`). Name collisions
+become `name (1).ext`; existing files are never overwritten.
+
+## Beyond the local network
+
+mDNS only works on a LAN. To connect across networks, give one peer a reachable
+address and dial it from the other side:
 
 ```bash
-cargo run -- start --name Alice --room myroom
+# on a machine with a reachable IP/port
+filemesh-rs start --name alice --room demo --listen /ip4/0.0.0.0/tcp/4001
+
+# on another network
+filemesh-rs start --name bob --room demo --connect /ip4/<ALICE_PUBLIC_IP>/tcp/4001
 ```
 
-Open another terminal and start a second peer:
+## Options
+
+| Flag | Meaning |
+|---|---|
+| `--download-dir <DIR>` | Where received files go (default `received_files`) |
+| `--auto-accept` | Download incoming files without asking (trusted rooms only) |
+| `--key-file <PATH>` | Identity key file (default `~/.filemesh/<name>.key`, created on first run) |
+| `--ephemeral` | Throw-away identity for this run |
+| `--listen <MULTIADDR>` | Listen address (default `/ip4/0.0.0.0/tcp/0`) |
+| `--connect <MULTIADDR>` | Dial a peer at startup (repeatable) |
+
+Your PeerId now survives restarts because the key is saved. Keep the key file
+private; anyone holding it can impersonate you.
+
+## How it works
+
+1. **Hash.** The sender splits the file into 1 MiB chunks and hashes each with
+   BLAKE3. The list of chunk hashes plus name and size is the *manifest*. The
+   hash of the manifest is the file's identity.
+2. **Offer.** The sender sends a tiny `Offer` (id, name, size) to the chosen
+   peers. No file data moves yet.
+3. **Accept.** The receiver fetches the manifest, checks that it matches the
+   offered id, then requests chunks (8 in flight at a time).
+4. **Verify.** Every chunk is checked against the manifest *before* it is
+   written. Bad chunks are re-requested; a run of failures aborts the download.
+5. **Resume.** Chunks are written at their final offsets into
+   `<download-dir>/.partial/`. After an interruption, accept the offer again
+   and only the missing chunks are fetched.
+
+## Layout
+
+| File | Role |
+|---|---|
+| `src/main.rs` | CLI and interactive prompt |
+| `src/libp2p_peers.rs` | Swarm, discovery, offers, downloads, serving |
+| `src/protocol.rs` | Wire messages, framing, size limits |
+| `src/manifest.rs` | Chunking, hashing, file identity |
+| `src/store.rs` | Verified, resumable on-disk chunk storage |
+| `src/identity.rs` | Persistent keypair |
+| `src/room.rs` | Gossipsub room topic |
+| `src/util.rs` | Sanitising of names from remote peers |
+
+## Testing
 
 ```bash
-cargo run -- start --name Bob --room myroom
+cargo test              # unit tests (manifest, store, protocol, sanitising, CLI parsing)
+./scripts/e2e.sh        # two real peers on loopback, SHA-256 compared
 ```
 
-### Commands
-
-Once a peer is running, you can use these commands:
-
-#### List Connected Peers
-
-```bash
-> peers
-```
-
-This displays all connected peers with their:
-- Peer name
-- Peer ID
-- Connection type (Direct, Relayed, or Hole-Punched)
-- Network addresses
-
-#### Send File to Specific Peer
-
-```bash
-> send --file document.pdf --to 12D3KooWAbc123...
-```
-
-Replace `12D3KooWAbc123...` with the actual peer ID from the `peers` command.
-
-#### Broadcast File to All Peers
-
-```bash
-> send --file photo.jpg --broadcast
-```
-
-This sends the file to all connected peers in the room.
-
-#### Get Help
-
-```bash
-> help
-```
-
-#### Exit
-
-```bash
-> quit
-```
-
-## Demo Scenario
-
-### Terminal 1: Alice
-
-```bash
-$ cargo run -- start --name Alice --room demo
-
-╔══════════════════════════════════════════════════╗
-║           FileMesh-RS - P2P File Transfer       ║
-╚══════════════════════════════════════════════════╝
-
-Starting peer: Alice (12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Bm4YPz...)
-Joined room: demo
-
-Listening on: /ip4/127.0.0.1/tcp/52847
-Listening on: /ip4/192.168.1.100/tcp/52847
-
-Available commands:
-  peers - List all connected peers with connection types
-  send --file <FILE> --to <PEER_ID> - Send file to specific peer
-  send --file <FILE> --broadcast - Broadcast file to all peers
-  quit - Exit the application
-
-→ Bob joined the room
-New peer connected: 12D3KooWQXyzAbcd... (Direct)
-
-> peers
-
-╔════════════════════════════════════════════╗
-║           Connected Peers                  ║
-╚════════════════════════════════════════════╝
-
-  1. Bob (12D3KooWQXyzAbcd...)
-     Connection Type: Direct
-     Addresses: /ip4/192.168.1.101/tcp/52848
-
-> send --file example.txt --to 12D3KooWQXyzAbcd...
-Sending file: example.txt to 12D3KooWQXyzAbcd...
-Sending... 100%
-✓ Sent file: example.txt to 12D3KooWQXyzAbcd...
-```
-
-### Terminal 2: Bob
-
-```bash
-$ cargo run -- start --name Bob --room demo
-
-╔══════════════════════════════════════════════════╗
-║           FileMesh-RS - P2P File Transfer       ║
-╚══════════════════════════════════════════════════╝
-
-Starting peer: Bob (12D3KooWQXyzAbcd...)
-Joined room: demo
-
-Listening on: /ip4/127.0.0.1/tcp/52848
-Listening on: /ip4/192.168.1.101/tcp/52848
-
-Available commands:
-  peers - List all connected peers with connection types
-  send --file <FILE> --to <PEER_ID> - Send file to specific peer
-  send --file <FILE> --broadcast - Broadcast file to all peers
-  quit - Exit the application
-
-→ Alice joined the room
-New peer connected: 12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Bm4YPz... (Direct)
-
-Receiving... 100%
-✓ Received file: example.txt from Alice (1024 bytes)
-
-> peers
-
-╔════════════════════════════════════════════╗
-║           Connected Peers                  ║
-╚════════════════════════════════════════════╝
-
-  1. Alice (12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Bm4YPz...)
-     Connection Type: Direct
-     Addresses: /ip4/192.168.1.100/tcp/52847
-```
-
-## Universal Connectivity
-
-FileMesh-RS demonstrates three types of connections:
-
-### 1. Direct Connection
-When peers are on the same network or have public IPs, they establish direct connections.
-
-**Log Example:**
-```
-New peer connected: 12D3KooW... (Direct)
-```
-
-### 2. Relayed Connection
-When direct connection fails due to NAT, peers communicate through a relay server.
-
-**Log Example:**
-```
-Discovered relay peer: 12D3KooW...
-New peer connected: 12D3KooW... (Relayed)
-```
-
-### 3. Hole-Punched Connection
-DCUtR upgrades relayed connections to direct connections when possible.
-
-**Log Example:**
-```
-New peer connected: 12D3KooW... (Relayed)
-Connection upgraded: 12D3KooW... Hole-Punched
-```
-
-## File Transfer Protocol
-
-The custom protocol `/filemesh/1.0.0` works as follows:
-
-1. **Handshake**: Sender opens a stream to receiver
-2. **Metadata**: Send file name length (4 bytes), file name, and file size (8 bytes)
-3. **Streaming**: Transfer file in 64KB chunks with progress tracking
-4. **Completion**: Close stream and confirm transfer
-
-Received files are automatically saved to the `received_files/` directory.
-
-## Network Protocols Used
-
-- **Transport**: TCP with Noise encryption and Yamux multiplexing
-- **Peer Discovery**: mDNS (local) and Gossipsub (global)
-- **Identity**: Identify protocol for peer information exchange
-- **NAT**: AutoNAT for NAT status detection
-- **Relay**: Circuit Relay v2 for relayed connections
-- **DCUtR**: Direct Connection Upgrade through Relay for hole-punching
-- **Ping**: Keep-alive and connectivity monitoring
-
-## Testing on Different Networks
-
-### Same Local Network (Direct)
-Run both peers on the same WiFi network. They should discover each other via mDNS and establish a direct connection.
-
-### Different Networks (Relayed/Hole-Punched)
-To test NAT traversal:
-1. Run one peer on your local network
-2. Run another peer on a different network (e.g., mobile hotspot, VPS, or different WiFi)
-3. Use a public relay server or run your own relay node
-4. Peers will connect via relay, then attempt hole-punching
-
-## Configuration
-
-### Custom Ports
-
-The application automatically selects available ports. To listen on specific ports, modify the `start()` function in `libp2p_peer.rs`:
-
-```rust
-self.swarm.listen_on("/ip4/0.0.0.0/tcp/YOUR_PORT".parse()?)?;
-```
-
-### Relay Servers
-
-The code currently relies on discovered relay peers. To use specific relay servers, add them in `libp2p_peer.rs`:
-
-```rust
-let relay_addr: Multiaddr = "/ip4/RELAY_IP/tcp/PORT/p2p/RELAY_PEER_ID".parse()?;
-self.swarm.dial(relay_addr)?;
-```
-
-## Performance
-
-- **Chunk Size**: 64KB for optimal streaming performance
-- **Connection Timeout**: 60 seconds for idle connections
-- **Heartbeat**: 1 second for gossipsub message propagation
-- **AutoNAT**: Status refresh every 30 seconds
-
-## Troubleshooting
-
-### Peers Not Discovering Each Other
-
-- Ensure both peers are in the same room
-- Check firewall settings
-- Verify network connectivity
-- Try on the same local network first (mDNS should work)
-
-### File Transfer Fails
-
-- Verify the file path is correct
-- Check file permissions
-- Ensure sufficient disk space in `received_files/` directory
-- Confirm peer is still connected with `peers` command
-
-### Connection Always Relayed
-
-- This is normal on restrictive NATs
-- Hole-punching attempts automatically via DCUtR
-- Direct connections work best on permissive networks
-
-## Development
-
-### Running Tests
-
-```bash
-cargo test
-```
-
-### Debug Logging
-
-For detailed libp2p logs, set the `RUST_LOG` environment variable:
-
-```bash
-RUST_LOG=debug cargo run -- start --name Alice --room myroom
-```
-
-### Code Structure
-
-- **main.rs**: CLI parsing and user command handling
-- **libp2p_peer.rs**: Core libp2p functionality, swarm events, connection management
-- **file_transfer.rs**: Custom NetworkBehaviour for file transfer protocol
-- **room.rs**: Gossipsub topic management for rooms
-
-## Security Considerations
-
-- All connections use Noise protocol for encryption
-- Peer authentication via cryptographic identities
-- No central server required
-- Files are transferred directly between peers
-
-## Future Enhancements
-
-- File encryption before transfer
-- Resume capability for interrupted transfers
-- Compression for text files
-- Web UI for easier interaction
-- DHT for persistent peer discovery
-- IPv6 support
-
-## License
-
-MIT License
-
-## Contributing
-
-Contributions welcome! Please open issues or pull requests on the repository.
-
-## Credits
-
-Built with:
-- [libp2p](https://libp2p.io/) - Peer-to-peer networking library
-- [tokio](https://tokio.rs/) - Async runtime
-- [clap](https://github.com/clap-rs/clap) - CLI argument parsing
-- [colored](https://github.com/mackwic/colored) - Terminal colors
+## Security notes
+
+- A peer's file name is never used as a path: only the final component is kept,
+  and bad characters are replaced.
+- Frame sizes are capped before anything is allocated.
+- A file's id acts as a capability: whoever knows it can fetch the file from the
+  sender. Offers go only to the peers you choose.
+- Traffic is encrypted (Noise) and peers are authenticated by key, but there is
+  no room password yet: anyone who knows a room name can join it.
