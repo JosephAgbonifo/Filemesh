@@ -35,16 +35,41 @@ become `name (1).ext`; existing files are never overwritten.
 
 ## Beyond the local network
 
-mDNS only works on a LAN. To connect across networks, give one peer a reachable
-address and dial it from the other side:
+mDNS only works on a LAN. For the internet, FileMesh uses a small **relay node**
+that you (or anyone) can host. It does three jobs: it relays traffic for peers
+behind NAT, it acts as the DHT bootstrap node peers use to find each other, and it
+runs an AutoNAT server. Peers then try to upgrade to a direct connection with
+hole punching, and fall back to the relay if that fails.
 
 ```bash
-# on a machine with a reachable IP/port
-filemesh-rs start --name alice --room demo --listen /ip4/0.0.0.0/tcp/4001
+# 1. On a machine with a public IP (open TCP+UDP port 4001):
+filemesh-rs relay --external /ip4/<PUBLIC_IP>/tcp/4001 --external /ip4/<PUBLIC_IP>/udp/4001/quic-v1
+#    It prints the --bootstrap address to hand out, e.g.
+#    /ip4/<PUBLIC_IP>/tcp/4001/p2p/12D3KooW...
 
-# on another network
-filemesh-rs start --name bob --room demo --connect /ip4/<ALICE_PUBLIC_IP>/tcp/4001
+# 2. Anyone, anywhere, with the same room name and that address:
+filemesh-rs start --name alice --room demo --bootstrap /ip4/<PUBLIC_IP>/tcp/4001/p2p/12D3KooW...
+filemesh-rs start --name bob   --room demo --bootstrap /ip4/<PUBLIC_IP>/tcp/4001/p2p/12D3KooW...
 ```
+
+Within about ten seconds alice and bob find each other (watch for
+`joined the room`). `peers` shows whether each link is `Direct`, `Relayed` or
+`Hole-Punched`.
+
+How discovery works: each peer announces the room on the DHT (a provider record
+keyed by a hash of the room name) and asks the DHT who else is there every 10 s.
+Discovered peers are dialed directly if an address is known, otherwise through
+the relay. The DHT is private to FileMesh (its own protocol name), not the public
+IPFS network.
+
+For a direct link without a relay, use `--listen` and `--connect`:
+
+```bash
+filemesh-rs start --name alice --room demo --listen /ip4/0.0.0.0/tcp/4001
+filemesh-rs start --name bob   --room demo --connect /ip4/<ALICE_IP>/tcp/4001
+```
+
+Peers listen on both TCP and QUIC by default.
 
 ## Options
 
@@ -54,8 +79,11 @@ filemesh-rs start --name bob --room demo --connect /ip4/<ALICE_PUBLIC_IP>/tcp/40
 | `--auto-accept` | Download incoming files without asking (trusted rooms only) |
 | `--key-file <PATH>` | Identity key file (default `~/.filemesh/<name>.key`, created on first run) |
 | `--ephemeral` | Throw-away identity for this run |
-| `--listen <MULTIADDR>` | Listen address (default `/ip4/0.0.0.0/tcp/0`) |
-| `--connect <MULTIADDR>` | Dial a peer at startup (repeatable) |
+| `--listen <MULTIADDR>` | Listen address, repeatable (default: TCP and QUIC on any free port) |
+| `--connect <MULTIADDR>` | Dial a peer directly at startup (repeatable) |
+| `--bootstrap <MULTIADDR>` | Relay/bootstrap node `.../p2p/<PeerId>` for internet discovery (repeatable) |
+| `--no-mdns` | Disable local-network discovery |
+| `--relay-only` | Reach room members only through the relay: no direct dials, no hole punching (debugging, restrictive networks) |
 
 Your PeerId now survives restarts because the key is saved. Keep the key file
 private; anyone holding it can impersonate you.
@@ -85,6 +113,7 @@ private; anyone holding it can impersonate you.
 | `src/manifest.rs` | Chunking, hashing, file identity |
 | `src/store.rs` | Verified, resumable on-disk chunk storage |
 | `src/identity.rs` | Persistent keypair |
+| `src/relay.rs` | The `relay` subcommand: circuit relay + DHT bootstrap node |
 | `src/room.rs` | Gossipsub room topic |
 | `src/util.rs` | Sanitising of names from remote peers |
 
@@ -93,6 +122,7 @@ private; anyone holding it can impersonate you.
 ```bash
 cargo test              # unit tests (manifest, store, protocol, sanitising, CLI parsing)
 ./scripts/e2e.sh        # two real peers on loopback, SHA-256 compared
+./scripts/relay_e2e.sh  # relay + two peers, every byte through a circuit (~1 min)
 ```
 
 ## Security notes
@@ -102,5 +132,10 @@ cargo test              # unit tests (manifest, store, protocol, sanitising, CLI
 - Frame sizes are capped before anything is allocated.
 - A file's id acts as a capability: whoever knows it can fetch the file from the
   sender. Offers go only to the peers you choose.
-- Traffic is encrypted (Noise) and peers are authenticated by key, but there is
-  no room password yet: anyone who knows a room name can join it.
+- Traffic is encrypted (Noise/QUIC) and peers are authenticated by key, including
+  when it passes through a relay. The relay can see that two peers talk and how
+  much, not what they send.
+- There is no room password yet: anyone who knows a room name can find and join
+  it, because room membership is discoverable through the DHT.
+- A relay you host carries other people's traffic. Use `--max-circuit-bytes` and
+  `--max-circuit-secs` to bound it (default: unlimited bytes, 1 hour per circuit).

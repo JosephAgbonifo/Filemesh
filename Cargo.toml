@@ -1,6 +1,6 @@
 [package]
 name = "filemesh-rs"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]
@@ -24,6 +24,8 @@ libp2p = { version = "0.53", features = [
     "dcutr",
     "autonat",
     "request-response",
+    "kad",
+    "quic",
     "macros",
     "tokio",
 ] }

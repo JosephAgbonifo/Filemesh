@@ -12,23 +12,33 @@ use colored::Colorize;
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use libp2p::{
-    autonat, dcutr, gossipsub, identify, mdns,
+    autonat, dcutr, gossipsub, identify, kad, mdns,
     multiaddr::Protocol,
     noise, ping, relay,
     request_response::{self, OutboundRequestId, ResponseChannel},
-    swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, yamux, Multiaddr, PeerId, Swarm, Transport,
+    swarm::{
+        behaviour::toggle::Toggle,
+        dial_opts::{DialOpts, PeerCondition},
+        NetworkBehaviour, SwarmEvent,
+    },
+    tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm,
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs::File,
     io::{self, Read, Seek, SeekFrom, Write},
     path::PathBuf,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 
 const PROTOCOL_VERSION: &str = "/filemesh/2.0.0";
+const KAD_PROTOCOL: &str = crate::relay::KAD_PROTOCOL;
+
+/// How often we ask the DHT who else is in our room.
+pub const DISCOVERY_INTERVAL: Duration = Duration::from_secs(10);
+/// Do not re-dial the same discovered peer more often than this.
+const REDIAL_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Chunk requests kept in flight per download.
 const WINDOW: usize = 8;
@@ -57,12 +67,13 @@ impl std::fmt::Display for ConnectionType {
 #[derive(NetworkBehaviour)]
 pub struct FileMeshBehaviour {
     pub gossipsub: gossipsub::Behaviour,
-    pub mdns: mdns::tokio::Behaviour,
+    pub mdns: Toggle<mdns::tokio::Behaviour>,
     pub identify: identify::Behaviour,
     pub ping: ping::Behaviour,
     pub relay_client: relay::client::Behaviour,
-    pub dcutr: dcutr::Behaviour,
-    pub autonat: autonat::Behaviour,
+    pub dcutr: Toggle<dcutr::Behaviour>,
+    pub autonat: Toggle<autonat::Behaviour>,
+    pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
     pub file_transfer: protocol::Behaviour,
 }
 
@@ -79,10 +90,18 @@ pub struct PeerConfig {
     pub auto_accept: bool,
     /// `None` = throw-away identity for this run.
     pub key_file: Option<PathBuf>,
-    /// Address to listen on, e.g. `/ip4/0.0.0.0/tcp/0` (any free port).
-    pub listen_addr: Multiaddr,
-    /// Peers to dial at startup (for connecting beyond the local network).
+    /// Addresses to listen on. Empty = TCP and QUIC on any free port.
+    pub listen_addrs: Vec<Multiaddr>,
+    /// Peers to dial at startup (direct connection, no discovery).
     pub dial_addrs: Vec<Multiaddr>,
+    /// Relay/bootstrap nodes (`.../p2p/<PeerId>`). Used for room discovery
+    /// through the DHT, relay reservations and NAT traversal.
+    pub bootstrap: Vec<Multiaddr>,
+    /// Discover peers on the local network via mDNS.
+    pub mdns: bool,
+    /// Reach room members only through the relay: no hole punching and no
+    /// direct dials of discovered peers.
+    pub relay_only: bool,
 }
 
 /// A file we have hashed and are willing to serve.
@@ -170,8 +189,14 @@ pub struct FileMeshPeer {
 
     download_dir: PathBuf,
     auto_accept: bool,
-    listen_addr: Multiaddr,
+    listen_addrs: Vec<Multiaddr>,
     dial_addrs: Vec<Multiaddr>,
+    bootstrap: Vec<(PeerId, Multiaddr)>,
+    reserved: HashSet<PeerId>,
+    last_dial: HashMap<PeerId, Instant>,
+    room_key: kad::RecordKey,
+    announced: bool,
+    relay_only: bool,
     internal_tx: mpsc::UnboundedSender<Internal>,
 
     // Sending side
@@ -213,72 +238,118 @@ impl FileMeshPeer {
             local_peer_id.to_string().bright_black()
         );
 
-        let gossipsub_config = gossipsub::ConfigBuilder::default()
-            .heartbeat_interval(Duration::from_secs(1))
-            .validation_mode(gossipsub::ValidationMode::Strict)
-            .build()
-            .context("Invalid gossipsub config")?;
+        let mut bootstrap = Vec::new();
+        for addr in &config.bootstrap {
+            let id = addr
+                .iter()
+                .find_map(|p| match p {
+                    Protocol::P2p(id) => Some(id),
+                    _ => None,
+                })
+                .with_context(|| {
+                    format!("bootstrap address {} must end in /p2p/<PeerId>", addr)
+                })?;
+            bootstrap.push((id, addr.clone()));
+        }
 
-        let gossipsub = gossipsub::Behaviour::new(
-            gossipsub::MessageAuthenticity::Signed(local_key.clone()),
-            gossipsub_config,
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to create gossipsub behaviour: {}", e))?;
+        let enable_mdns = config.mdns;
+        let enable_hole_punch = !config.relay_only;
+        let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                noise::Config::new,
+                yamux::Config::default,
+            )?
+            .with_quic()
+            .with_dns()?
+            .with_relay_client(noise::Config::new, yamux::Config::default)?
+            .with_behaviour(|key, relay_client| {
+                let gossipsub_config = gossipsub::ConfigBuilder::default()
+                    .heartbeat_interval(Duration::from_secs(1))
+                    .validation_mode(gossipsub::ValidationMode::Strict)
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("Invalid gossipsub config: {}", e))?;
 
-        let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?;
+                let gossipsub = gossipsub::Behaviour::new(
+                    gossipsub::MessageAuthenticity::Signed(key.clone()),
+                    gossipsub_config,
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to create gossipsub behaviour: {}", e))?;
 
-        let identify = identify::Behaviour::new(identify::Config::new(
-            PROTOCOL_VERSION.to_string(),
-            local_key.public(),
-        ));
+                let mdns = if enable_mdns {
+                    Toggle::from(Some(mdns::tokio::Behaviour::new(
+                        mdns::Config::default(),
+                        local_peer_id,
+                    )?))
+                } else {
+                    Toggle::from(None)
+                };
 
-        let ping = ping::Behaviour::new(ping::Config::new());
+                let identify = identify::Behaviour::new(identify::Config::new(
+                    PROTOCOL_VERSION.to_string(),
+                    key.public(),
+                ));
 
-        let (relay_transport, relay_client) = relay::client::new(local_peer_id);
+                // AutoNAT makes peers dial each other back directly, which would
+                // defeat --relay-only, so it is off in that mode.
+                let autonat = if enable_hole_punch {
+                    Toggle::from(Some(autonat::Behaviour::new(
+                        local_peer_id,
+                        autonat::Config {
+                            retry_interval: Duration::from_secs(10),
+                            refresh_interval: Duration::from_secs(30),
+                            boot_delay: Duration::from_secs(5),
+                            throttle_server_period: Duration::from_secs(1),
+                            ..Default::default()
+                        },
+                    )))
+                } else {
+                    Toggle::from(None)
+                };
 
-        let dcutr = dcutr::Behaviour::new(local_peer_id);
+                // A private DHT (own protocol name), separate from public IPFS.
+                let mut kad_cfg = kad::Config::default();
+                kad_cfg.set_protocol_names(vec![StreamProtocol::new(KAD_PROTOCOL)]);
+                let kademlia = kad::Behaviour::with_config(
+                    local_peer_id,
+                    kad::store::MemoryStore::new(local_peer_id),
+                    kad_cfg,
+                );
 
-        let autonat = autonat::Behaviour::new(
-            local_peer_id,
-            autonat::Config {
-                retry_interval: Duration::from_secs(10),
-                refresh_interval: Duration::from_secs(30),
-                boot_delay: Duration::from_secs(5),
-                throttle_server_period: Duration::from_secs(1),
-                ..Default::default()
-            },
-        );
-
-        // Combine relay transport with direct TCP transport so that relay client
-        // stays alive and can establish relayed connections.
-        let transport = relay_transport
-            .or_transport(tcp::tokio::Transport::default())
-            .upgrade(libp2p::core::upgrade::Version::V1)
-            .authenticate(noise::Config::new(&local_key)?)
-            .multiplex(yamux::Config::default())
-            .boxed();
-
-        let behaviour = FileMeshBehaviour {
-            gossipsub,
-            mdns,
-            identify,
-            ping,
-            relay_client,
-            dcutr,
-            autonat,
-            file_transfer: protocol::new_behaviour(),
-        };
-
-        let swarm = Swarm::new(
-            transport,
-            behaviour,
-            local_peer_id,
+                Ok(FileMeshBehaviour {
+                    gossipsub,
+                    mdns,
+                    identify,
+                    ping: ping::Behaviour::new(ping::Config::new()),
+                    relay_client,
+                    dcutr: if enable_hole_punch {
+                        Toggle::from(Some(dcutr::Behaviour::new(local_peer_id)))
+                    } else {
+                        Toggle::from(None)
+                    },
+                    autonat,
+                    kademlia,
+                    file_transfer: protocol::new_behaviour(),
+                })
+            })?
             // Long idle timeout so quiet peers stay in the room between transfers.
-            libp2p::swarm::Config::with_tokio_executor()
-                .with_idle_connection_timeout(Duration::from_secs(3600)),
-        );
+            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(3600)))
+            .build();
+
+        if config.relay_only {
+            // Do not become a DHT server (which would hand out our direct
+            // addresses); stay a client so everything goes through the relay.
+            swarm
+                .behaviour_mut()
+                .kademlia
+                .set_mode(Some(kad::Mode::Client));
+        }
 
         let room = Room::new(config.room_name, local_peer_id);
+        let room_key = kad::RecordKey::new(
+            &blake3::hash(format!("filemesh-room-v1:{}", room.name()).as_bytes()).as_bytes(),
+        );
 
         Ok(FileMeshPeer {
             swarm,
@@ -288,8 +359,14 @@ impl FileMeshPeer {
             relay_peers: HashSet::new(),
             download_dir: config.download_dir,
             auto_accept: config.auto_accept,
-            listen_addr: config.listen_addr,
+            listen_addrs: config.listen_addrs,
             dial_addrs: config.dial_addrs,
+            bootstrap,
+            reserved: HashSet::new(),
+            last_dial: HashMap::new(),
+            room_key,
+            announced: false,
+            relay_only: config.relay_only,
             internal_tx,
             shared: HashMap::new(),
             served: HashMap::new(),
@@ -302,7 +379,17 @@ impl FileMeshPeer {
     }
 
     fn start(&mut self) -> Result<()> {
-        self.swarm.listen_on(self.listen_addr.clone())?;
+        let listen_addrs = if self.listen_addrs.is_empty() {
+            vec![
+                "/ip4/0.0.0.0/tcp/0".parse()?,
+                "/ip4/0.0.0.0/udp/0/quic-v1".parse()?,
+            ]
+        } else {
+            self.listen_addrs.clone()
+        };
+        for addr in listen_addrs {
+            self.swarm.listen_on(addr)?;
+        }
 
         self.room.join(&mut self.swarm.behaviour_mut().gossipsub)?;
         self.broadcast_join();
@@ -321,6 +408,25 @@ impl FileMeshPeer {
                 "{}",
                 "Auto-accept is ON: incoming files are downloaded without asking.".yellow()
             );
+        }
+        for (peer_id, addr) in self.bootstrap.clone() {
+            println!(
+                "{} {}",
+                "Bootstrap:".bright_cyan(),
+                addr.to_string().bright_black()
+            );
+            // Our own address (without the /p2p part) goes into the DHT table.
+            let plain: Multiaddr = addr
+                .iter()
+                .filter(|p| !matches!(p, Protocol::P2p(_)))
+                .collect();
+            self.swarm
+                .behaviour_mut()
+                .kademlia
+                .add_address(&peer_id, plain);
+            if let Err(e) = self.swarm.dial(addr) {
+                println!("{} {}", "Could not dial bootstrap node:".red(), e);
+            }
         }
         for addr in self.dial_addrs.clone() {
             println!("{} {}", "Dialing:".bright_cyan(), addr.to_string().bright_black());
@@ -459,7 +565,7 @@ impl FileMeshPeer {
     }
 
     fn on_connection_established(&mut self, peer_id: PeerId, remote: Multiaddr) {
-        let relayed = remote.iter().any(|p| matches!(p, Protocol::P2pCircuit));
+        let relayed = is_relayed(&remote);
         let kind = if relayed {
             ConnectionType::Relayed
         } else {
@@ -481,6 +587,115 @@ impl FileMeshPeer {
 
         // Tell the new peer who we are.
         self.broadcast_join();
+
+        if self.bootstrap.iter().any(|(id, _)| *id == peer_id) {
+            self.on_bootstrap_connected(peer_id);
+        }
+    }
+
+    // ------------------------------------------- internet connectivity
+
+    /// We reached a relay/bootstrap node: reserve a relay slot (so others can
+    /// reach us through it) and start filling the DHT routing table.
+    fn on_bootstrap_connected(&mut self, relay_id: PeerId) {
+        if self.reserved.insert(relay_id) {
+            for (id, addr) in self.bootstrap.clone() {
+                if id != relay_id {
+                    continue;
+                }
+                match self.swarm.listen_on(addr.with(Protocol::P2pCircuit)) {
+                    Ok(_) => println!(
+                        "{} {}",
+                        "Requesting relay reservation on:".bright_cyan(),
+                        relay_id.to_string().bright_black()
+                    ),
+                    Err(e) => println!("{} {}", "Could not reserve relay slot:".red(), e),
+                }
+                break;
+            }
+        }
+        let _ = self.swarm.behaviour_mut().kademlia.bootstrap();
+    }
+
+    fn announce_room(&mut self) {
+        match self
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .start_providing(self.room_key.clone())
+        {
+            Ok(_) => println!("{}", "Announced this room on the DHT.".bright_black()),
+            Err(e) => println!("{} {}", "Could not announce room:".red(), e),
+        }
+    }
+
+    /// Runs every [`DISCOVERY_INTERVAL`]: keep our room announcement fresh and
+    /// ask the DHT who else is in the room.
+    fn discovery_tick(&mut self) {
+        if self.bootstrap.is_empty() {
+            return;
+        }
+        let connected_to_bootstrap = self
+            .bootstrap
+            .iter()
+            .any(|(id, _)| self.swarm.is_connected(id));
+        if !connected_to_bootstrap {
+            // Lost the bootstrap node: try again.
+            for (_, addr) in self.bootstrap.clone() {
+                let _ = self.swarm.dial(addr);
+            }
+            return;
+        }
+        if !self.announced {
+            self.announced = true;
+            self.announce_room();
+        }
+        self.swarm
+            .behaviour_mut()
+            .kademlia
+            .get_providers(self.room_key.clone());
+    }
+
+    /// Dial room members the DHT told us about: directly if any address is
+    /// known, otherwise through each relay (`.../p2p-circuit/p2p/<peer>`).
+    fn dial_providers(&mut self, providers: HashSet<PeerId>) {
+        for peer in providers {
+            if peer == *self.local_peer_id() || self.swarm.is_connected(&peer) {
+                continue;
+            }
+            if let Some(last) = self.last_dial.get(&peer) {
+                if last.elapsed() < REDIAL_BACKOFF {
+                    continue;
+                }
+            }
+            self.last_dial.insert(peer, Instant::now());
+
+            let via_relay: Vec<Multiaddr> = self
+                .bootstrap
+                .iter()
+                .map(|(_, addr)| {
+                    addr.clone()
+                        .with(Protocol::P2pCircuit)
+                        .with(Protocol::P2p(peer))
+                })
+                .collect();
+            let builder = DialOpts::peer_id(peer)
+                .addresses(via_relay)
+                .condition(PeerCondition::DisconnectedAndNotDialing);
+            let opts = if self.relay_only {
+                builder.build()
+            } else {
+                // Also try any direct addresses the DHT/identify told us about.
+                builder.extend_addresses_through_behaviour().build()
+            };
+            if let Err(e) = self.swarm.dial(opts) {
+                println!(
+                    "{} {}",
+                    "Could not dial room member:".bright_black(),
+                    e.to_string().bright_black()
+                );
+            }
+        }
     }
 
     fn on_join(&mut self, author: PeerId, raw_name: &str) {
@@ -1259,6 +1474,16 @@ impl FileMeshPeer {
                     }
                 }
 
+                // Peers that serve the DHT go into our routing table.
+                if info.protocols.iter().any(|p| p.as_ref() == KAD_PROTOCOL) {
+                    for addr in &info.listen_addrs {
+                        self.swarm
+                            .behaviour_mut()
+                            .kademlia
+                            .add_address(&peer_id, addr.clone());
+                    }
+                }
+
                 if info
                     .protocols
                     .iter()
@@ -1296,11 +1521,44 @@ impl FileMeshPeer {
                 );
             }
 
+            SwarmEvent::Behaviour(FileMeshBehaviourEvent::Kademlia(
+                kad::Event::OutboundQueryProgressed {
+                    result:
+                        kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders {
+                            providers,
+                            ..
+                        })),
+                    ..
+                },
+            )) => self.dial_providers(providers),
+
+            SwarmEvent::Behaviour(FileMeshBehaviourEvent::RelayClient(
+                relay::client::Event::ReservationReqAccepted {
+                    relay_peer_id,
+                    renewal,
+                    ..
+                },
+            )) => {
+                if !renewal {
+                    println!(
+                        "{} {}",
+                        "Reachable through relay:".bright_green(),
+                        relay_peer_id.to_string().bright_black()
+                    );
+                    // Re-announce so our record now carries the relayed address.
+                    self.announce_room();
+                }
+            }
+
             SwarmEvent::Behaviour(FileMeshBehaviourEvent::FileTransfer(event)) => {
                 self.handle_transfer_event(event)
             }
 
             SwarmEvent::NewListenAddr { address, .. } => {
+                if address.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+                    // Advertise the relayed address so others can dial us through it.
+                    self.swarm.add_external_address(address.clone());
+                }
                 println!(
                     "{} {}",
                     "Listening on:".bright_cyan(),
@@ -1328,6 +1586,50 @@ impl FileMeshPeer {
     }
 }
 
+/// True for connections that go through a relay. The dialing side of a circuit
+/// shows `.../p2p-circuit/...`; the accepting side only sees `/p2p/<peer>` with
+/// no transport address at all.
+fn is_relayed(addr: &Multiaddr) -> bool {
+    let has_circuit = addr.iter().any(|p| matches!(p, Protocol::P2pCircuit));
+    let has_transport_host = addr.iter().any(|p| {
+        matches!(
+            p,
+            Protocol::Ip4(_)
+                | Protocol::Ip6(_)
+                | Protocol::Dns(_)
+                | Protocol::Dns4(_)
+                | Protocol::Dns6(_)
+                | Protocol::Dnsaddr(_)
+        )
+    });
+    has_circuit || !has_transport_host
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ma(s: &str) -> Multiaddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn classifies_relayed_and_direct_addresses() {
+        let peer = "12D3KooWPqZRctnvftjF2NB4xJdzzyuEefewn4aZ91nAEC1Wn4Fy";
+        // dialer side of a circuit
+        assert!(is_relayed(&ma(&format!(
+            "/ip4/1.2.3.4/tcp/4001/p2p/{peer}/p2p-circuit/p2p/{peer}"
+        ))));
+        // accepting side of a circuit: no transport address at all
+        assert!(is_relayed(&ma(&format!("/p2p/{peer}"))));
+        // ordinary direct connections
+        assert!(!is_relayed(&ma("/ip4/10.0.0.5/tcp/4001")));
+        assert!(!is_relayed(&ma("/ip4/10.0.0.5/udp/4001/quic-v1")));
+        assert!(!is_relayed(&ma("/dns4/example.com/tcp/4001")));
+        assert!(!is_relayed(&ma(&format!("/ip6/::1/tcp/4001/p2p/{peer}"))));
+    }
+}
+
 pub async fn run_peer(
     config: PeerConfig,
     mut cmd_rx: mpsc::UnboundedReceiver<UserCommand>,
@@ -1335,6 +1637,8 @@ pub async fn run_peer(
     let (internal_tx, mut internal_rx) = mpsc::unbounded_channel();
     let mut peer = FileMeshPeer::new(config, internal_tx)?;
     peer.start()?;
+
+    let mut discovery = tokio::time::interval(DISCOVERY_INTERVAL);
 
     loop {
         // Prioritise user commands to keep the UI responsive.
@@ -1346,6 +1650,7 @@ pub async fn run_peer(
                 }
             }
             Some(event) = internal_rx.recv() => peer.handle_internal(event),
+            _ = discovery.tick() => peer.discovery_tick(),
             event = peer.swarm.select_next_some() => peer.handle_swarm_event(event),
         }
     }

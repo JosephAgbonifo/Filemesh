@@ -2,6 +2,7 @@ mod identity;
 mod libp2p_peers;
 mod manifest;
 mod protocol;
+mod relay;
 mod room;
 mod store;
 mod util;
@@ -49,14 +50,55 @@ enum Commands {
         #[arg(long)]
         ephemeral: bool,
 
-        /// Address to listen on
-        #[arg(long, default_value = "/ip4/0.0.0.0/tcp/0")]
-        listen: Multiaddr,
+        /// Address to listen on (repeatable). Default: TCP and QUIC on any free port
+        #[arg(long)]
+        listen: Vec<Multiaddr>,
+
+        /// Do not use mDNS local-network discovery (rely on --bootstrap / --connect only)
+        #[arg(long)]
+        no_mdns: bool,
+
+        /// Reach room members only through the relay: never dial them directly and
+        /// never hole-punch (for debugging, or networks where direct links are blocked)
+        #[arg(long)]
+        relay_only: bool,
+
+        /// Relay/bootstrap node, e.g. /ip4/203.0.113.7/tcp/4001/p2p/<PeerId> (repeatable).
+        /// Enables room discovery over the internet, relaying and NAT hole punching.
+        #[arg(long = "bootstrap")]
+        bootstrap: Vec<Multiaddr>,
 
         /// Dial a peer at startup, e.g. /ip4/203.0.113.7/tcp/4001 (repeatable).
         /// Use this to join a room beyond your local network.
         #[arg(long = "connect")]
         connect: Vec<Multiaddr>,
+    },
+
+    /// Run a public relay + bootstrap node so peers can find each other across the internet
+    Relay {
+        /// Address to listen on (repeatable). Default: TCP and QUIC on port 4001
+        #[arg(long)]
+        listen: Vec<Multiaddr>,
+
+        /// Public address to advertise, e.g. /ip4/203.0.113.7/tcp/4001 (repeatable)
+        #[arg(long)]
+        external: Vec<Multiaddr>,
+
+        /// Identity key file (default: ~/.filemesh/relay.key, created on first run)
+        #[arg(long, conflicts_with = "ephemeral")]
+        key_file: Option<PathBuf>,
+
+        /// Use a throw-away identity for this run
+        #[arg(long)]
+        ephemeral: bool,
+
+        /// Maximum duration of one relayed connection, in seconds
+        #[arg(long, default_value_t = 3600)]
+        max_circuit_secs: u64,
+
+        /// Maximum bytes per relayed connection (0 = unlimited)
+        #[arg(long, default_value_t = 0)]
+        max_circuit_bytes: u64,
     },
 }
 
@@ -88,6 +130,9 @@ async fn main() -> Result<()> {
             key_file,
             ephemeral,
             listen,
+            no_mdns,
+            relay_only,
+            bootstrap,
             connect,
         } => {
             let key_file = if ephemeral {
@@ -101,10 +146,35 @@ async fn main() -> Result<()> {
                 download_dir,
                 auto_accept,
                 key_file,
-                listen_addr: listen,
+                listen_addrs: listen,
                 dial_addrs: connect,
+                bootstrap,
+                mdns: !no_mdns,
+                relay_only,
             };
             start_peer(config).await?;
+        }
+        Commands::Relay {
+            listen,
+            external,
+            key_file,
+            ephemeral,
+            max_circuit_secs,
+            max_circuit_bytes,
+        } => {
+            let key_file = if ephemeral {
+                None
+            } else {
+                Some(key_file.unwrap_or_else(|| identity::default_key_path("relay")))
+            };
+            relay::run_relay(relay::RelayConfig {
+                listen_addrs: listen,
+                external_addrs: external,
+                key_file,
+                max_circuit_secs,
+                max_circuit_bytes,
+            })
+            .await?;
         }
     }
 
